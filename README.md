@@ -7,8 +7,8 @@ OBS의 방송·녹화·장면 기능은 전부 빼고, "보면서 게임하기"�
 
 ## 다운로드와 설치
 
-1. [Releases](../../releases/latest)에서 `CapView-x.y.z-macOS.zip`을 받아 압축을 풉니다.
-2. `CapView.app`을 `응용 프로그램`(Applications) 폴더로 옮깁니다.
+1. [Releases](../../releases/latest)에서 `CapView-x.y.z.dmg`를 받아 엽니다.
+2. 열린 창에서 **CapView를 Applications 폴더로 끌어다 놓습니다.** (창 아래에 첫 실행 방법이 그림으로 나와 있어요)
 3. 처음 한 번만: 앱을 열면 "Apple이 악성 코드가 없음을 확인할 수 없습니다"라는 경고가 뜹니다.
    (유료 Apple 개발자 공증을 받지 않은 개인 프로젝트라서 그렇습니다.)
    **시스템 설정 › 개인정보 보호 및 보안**으로 가서 아래쪽의 **"그래도 열기"**를 누르고, 다시 열 때 **"열기"**를 누르세요.
@@ -140,8 +140,14 @@ OBS 코드는 사용하지 않았습니다(OBS는 GPL 라이선스). 같은 macO
 ./scripts/build-app.sh dist
 ```
 
-Apple Silicon·Intel 겸용(universal) 앱을 만들고, 개인 인증서 대신 ad-hoc 서명을 한 뒤 `build/CapView-<버전>-macOS.zip`으로 묶습니다.
-이 zip을 GitHub Release에 올리면 됩니다.
+```bash
+./scripts/make-dmg.sh
+```
+
+`dist`는 Apple Silicon·Intel 겸용(universal) 앱을 만들고, 개인 인증서 대신 ad-hoc 서명을 한 뒤 `build/CapView-<버전>-macOS.zip`으로도 묶습니다.
+`make-dmg.sh`는 그 앱으로 끌어다 놓는 설치 창과 첫 실행 안내 그림이 들어간 `build/CapView-<버전>.dmg`를 만듭니다
+(처음 실행할 때 Finder 제어 권한을 묻습니다). 안내 그림은 `scripts/dmg-background.py`로 다시 그릴 수 있습니다(Pillow 필요).
+둘 다 GitHub Release에 올리면 됩니다.
 
 ## 라이선스
 
