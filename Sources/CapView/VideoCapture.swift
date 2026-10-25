@@ -1,6 +1,9 @@
 import AVFoundation
 import CoreAudio
+import CoreImage
+import ImageIO
 import Synchronization
+import UniformTypeIdentifiers
 
 /// A capture device as shown in the menus.
 struct VideoDeviceInfo: Sendable, Hashable {
@@ -11,6 +14,12 @@ struct VideoDeviceInfo: Sendable, Hashable {
     let isVirtual: Bool
     /// Offers at least 720p at 50+ fps, as capture cards do (most webcams don't).
     let looksLikeCaptureCard: Bool
+}
+
+/// A captured frame, already encoded for the clipboard.
+struct Snapshot: Sendable {
+    let png: Data
+    let tiff: Data
 }
 
 /// The format the device is actually running at.
@@ -75,6 +84,11 @@ final class VideoCapture: NSObject, @unchecked Sendable, AVCaptureVideoDataOutpu
     // Session queue only.
     private var input: AVCaptureDeviceInput?
     private var lastChoice: VideoFormatPicker.Choice?
+
+    // Frame queue only: screenshots waiting for the next frame.
+    private var pendingSnapshots: [(id: Int, settings: PictureSettings, completion: @MainActor @Sendable (Snapshot?) -> Void)] = []
+    private var snapshotSerial = 0
+    private let snapshotContext = CIContext(options: [.cacheIntermediates: false])
 
     @MainActor
     override init() {
@@ -275,10 +289,68 @@ final class VideoCapture: NSObject, @unchecked Sendable, AVCaptureVideoDataOutpu
         device.unlockForConfiguration()
     }
 
+    // MARK: Snapshot
+
+    /// Grabs the next frame as it looks on screen (with `settings` applied),
+    /// encoded as PNG and TIFF. Calls back with `nil` if no frame arrives
+    /// within half a second.
+    func snapshot(settings: PictureSettings, completion: @escaping @MainActor @Sendable (Snapshot?) -> Void) {
+        frameQueue.async { [self] in
+            snapshotSerial &+= 1
+            let id = snapshotSerial
+            pendingSnapshots.append((id, settings, completion))
+            frameQueue.asyncAfter(deadline: .now() + 0.5) { [self] in
+                // Only this request times out; a newer one may still get a frame.
+                guard let index = pendingSnapshots.firstIndex(where: { $0.id == id }) else { return }
+                let request = pendingSnapshots.remove(at: index)
+                DispatchQueue.main.async { MainActor.assumeIsolated { request.completion(nil) } }
+            }
+        }
+    }
+
+    /// Renders and encodes off the frame queue so capture timing is not
+    /// disturbed; the pixel buffer is only held for that one render.
+    private func renderSnapshot(_ pixelBuffer: CVPixelBuffer, settings: PictureSettings,
+                                completions: [@MainActor @Sendable (Snapshot?) -> Void]) {
+        let context = snapshotContext
+        nonisolated(unsafe) let buffer = pixelBuffer
+        DispatchQueue.global(qos: .userInitiated).async {
+            var image = CIImage(cvPixelBuffer: buffer)
+            for filter in PictureFilters.make(settings) ?? [] {
+                filter.setValue(image, forKey: kCIInputImageKey)
+                image = filter.outputImage ?? image
+            }
+            var snapshot: Snapshot?
+            if let cgImage = context.createCGImage(
+                image, from: image.extent, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+            ), let png = Self.encode(cgImage, as: .png), let tiff = Self.encode(cgImage, as: .tiff) {
+                snapshot = Snapshot(png: png, tiff: tiff)
+            }
+            let result = snapshot
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { completions.forEach { $0(result) } }
+            }
+        }
+    }
+
+    private static func encode(_ image: CGImage, as type: UTType) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
+    }
+
     // MARK: AVCaptureVideoDataOutputSampleBufferDelegate (frame queue)
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         framesReceived.wrappingAdd(1, ordering: .relaxed)
+        if let latest = pendingSnapshots.last, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            let completions = pendingSnapshots.map(\.completion)
+            pendingSnapshots.removeAll()
+            renderSnapshot(pixelBuffer, settings: latest.settings, completions: completions)
+        }
         guard isVisible.load(ordering: .relaxed) else { return }
         // Show this frame now, replacing anything older, regardless of timestamps.
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),

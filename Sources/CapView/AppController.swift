@@ -399,6 +399,24 @@ final class AppController: NSObject, NSMenuDelegate {
         pictureAdjustments.show(beside: player.window)
     }
 
+    /// Copies the current picture (with adjustments) to the clipboard as PNG
+    /// and TIFF, so it pastes into chat apps as well as image editors.
+    @objc private func copySnapshot() {
+        guard !Self.isKeyRepeat else { return }
+        video.snapshot(settings: Prefs.picture) { [weak self] snapshot in
+            guard let snapshot else {
+                self?.player.videoView.showToast("캡처할 화면이 없습니다")
+                return
+            }
+            let item = NSPasteboardItem()
+            item.setData(snapshot.png, forType: .png)
+            item.setData(snapshot.tiff, forType: .tiff)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([item])
+            self?.player.videoView.showToast("화면을 클립보드에 복사했습니다")
+        }
+    }
+
     @objc private func toggleFullScreen() {
         guard !Self.isKeyRepeat else { return }
         player.toggleFullScreen()
@@ -483,6 +501,8 @@ final class AppController: NSObject, NSMenuDelegate {
 
     private func makeContextMenu() -> NSMenu {
         let menu = NSMenu()
+        menu.addItem("화면 캡처 (클립보드에 복사)", self, #selector(copySnapshot), nil, key: "c")
+        menu.addItem(.separator())
         for (title, fill) in [("비디오", fillVideoMenu), ("오디오", fillAudioMenu)] as [(String, (NSMenu) -> Void)] {
             let submenu = NSMenu(title: title)
             fill(submenu)
@@ -574,6 +594,9 @@ final class AppController: NSObject, NSMenuDelegate {
         menu.addItem("항상 위에 표시", self, #selector(toggleFloating), nil, key: "t", checked: player.isFloating)
         menu.addItem("실제 픽셀 크기", self, #selector(actualSize), nil, key: "0")
         menu.addItem(.separator())
+        if !appending {
+            menu.addItem("화면 캡처 (클립보드에 복사)", self, #selector(copySnapshot), nil, key: "c")
+        }
         menu.addItem("화면 조정…", self, #selector(showPictureAdjustments), nil, key: "e")
     }
 
