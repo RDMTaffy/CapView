@@ -17,6 +17,17 @@ OBS의 방송·녹화·장면 기능은 전부 빼고, "보면서 게임하기"�
 
 요구 사항: macOS 15 이상, Apple Silicon 또는 Intel Mac, UVC 방식 USB 캡처보드.
 
+## Windows (베타)
+
+같은 기능의 Windows 버전이 있습니다. 아직 베타라 문제가 있으면 알려 주세요.
+
+1. [Releases](../../releases)에서 Windows 베타의 `CapView-x.y.z-Setup.exe`를 받아 실행합니다. (설치 없이 쓰려면 `…-windows-x64.zip`)
+2. 처음 한 번만 파란 **"Windows의 PC 보호"** 창이 뜨면 **"추가 정보" → "실행"**을 누르세요. (코드 서명 인증서가 없어서 뜨는 창입니다)
+3. 화면이 안 나오면 **설정 › 개인 정보 및 보안 › 카메라**에서 "데스크톱 앱이 카메라에 액세스하도록 허용"을 켜세요. 소리는 같은 곳의 **마이크**.
+4. 문제가 생기면 오른쪽 클릭 › **로그 폴더 열기**에서 `capview.log`를 보내 주세요.
+
+요구 사항: Windows 10/11 64비트 (N/KN 에디션은 '미디어 기능 팩' 필요). 단축키는 Mac과 같고 `⌘` 대신 `Ctrl`입니다.
+
 ## 기능
 
 - 캡처보드 자동 인식, 영상은 원본 비율 그대로(레터박스) 표시
@@ -148,6 +159,22 @@ OBS 코드는 사용하지 않았습니다(OBS는 GPL 라이선스). 같은 macO
 `make-dmg.sh`는 그 앱으로 끌어다 놓는 설치 창과 첫 실행 안내 그림이 들어간 `build/CapView-<버전>.dmg`를 만듭니다
 (처음 실행할 때 Finder 제어 권한을 묻습니다). 안내 그림은 `scripts/dmg-background.py`로 다시 그릴 수 있습니다(Pillow 필요).
 둘 다 GitHub Release에 올리면 됩니다.
+
+## Windows 버전 빌드
+
+macOS(또는 Linux)에서 mingw-w64로 교차 빌드합니다.
+
+```bash
+brew install mingw-w64 makensis
+```
+
+```bash
+./windows/build.sh package
+```
+
+`build/windows/`에 `CapView.exe`, 휴대용 zip, 설치 프로그램(`CapView-<버전>-Setup.exe`)이 생깁니다.
+코드는 `windows/src`(C++20, Win32 + Media Foundation + Direct3D 11 + WASAPI)에 있고, 동작 규칙은 `windows/SPEC.md`에 정리돼 있습니다.
+Visual Studio로 빌드한다면 링커 매니페스트 생성을 끄세요(`/MANIFEST:NO`). 매니페스트는 `windows/res/app.rc`가 이미 넣습니다.
 
 ## 라이선스
 

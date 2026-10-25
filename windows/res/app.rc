@@ -1,0 +1,33 @@
+#include <windows.h>
+#include "../src/resource.h"
+#include "../src/version.h"
+
+IDI_APPICON ICON "CapView.ico"
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION CAPVIEW_VERSION_COMMA
+PRODUCTVERSION CAPVIEW_VERSION_COMMA
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041204B0"
+        BEGIN
+            VALUE "CompanyName", "CapView"
+            VALUE "FileDescription", "CapView - capture card viewer"
+            VALUE "FileVersion", CAPVIEW_VERSION_DOTTED
+            VALUE "InternalName", "CapView"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "CapView.exe"
+            VALUE "ProductName", "CapView"
+            VALUE "ProductVersion", CAPVIEW_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0412, 1200
+    END
+END
