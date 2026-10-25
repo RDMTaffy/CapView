@@ -47,6 +47,9 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN" "$APP_DIR/Contents/MacOS/${APP_NAME}"
 cp Resources/Info.plist "$APP_DIR/Contents/Info.plist"
+# A new build number per build makes macOS re-read the bundle (icon caches
+# in the Dock / app list are keyed by it).
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(date +%Y%m%d.%H%M%S)" "$APP_DIR/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
@@ -78,5 +81,7 @@ if [[ "$MODE" == install ]]; then
     fi
     rm -rf "/Applications/${APP_NAME}.app"
     ditto "$APP_DIR" "/Applications/${APP_NAME}.app"
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -f "/Applications/${APP_NAME}.app"
     echo "Installed /Applications/${APP_NAME}.app"
 fi
