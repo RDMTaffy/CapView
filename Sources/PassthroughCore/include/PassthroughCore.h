@@ -25,10 +25,18 @@ typedef struct {
     uint64_t underruns;
     /// The capture device stopped delivering audio (USB stall, unplug, ...).
     uint64_t inputGaps;
+    /// Input chunks dropped because the ring was full (output stalled).
     uint64_t overruns;
+    /// A backlog was dropped (crossfaded) to bring the latency back to the target.
     uint64_t resyncs;
     uint64_t inputCallbacks;
     uint64_t outputCallbacks;
+    /// Every time the output ran dry, whatever the cause (faded out and back in).
+    uint64_t dropouts;
+    /// The input AudioUnitRender failed and a chunk was lost.
+    uint64_t inputErrors;
+    /// The output device's sample time jumped: the HAL skipped output cycles.
+    uint64_t outputSkips;
 } PTStats;
 
 /// `ringFrames` must be a power of two. `maxIOFrames` bounds every render slice.
@@ -47,6 +55,8 @@ double pt_input_sample_rate(const PTCore *_Nonnull core);
 /// device's own rate. Resets the ring so stale audio is never played.
 OSStatus pt_start_output(PTCore *_Nonnull core, AudioObjectID device, uint32_t ioFrames, double inputSampleRate);
 void pt_stop_output(PTCore *_Nonnull core);
+/// The output device rate the last pt_start_output configured.
+double pt_output_sample_rate(const PTCore *_Nonnull core);
 
 // Thread-safe.
 

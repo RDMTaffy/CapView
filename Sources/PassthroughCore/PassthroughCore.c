@@ -10,6 +10,12 @@
 // fill level toward a small target with a PI controller on the Varispeed
 // playback rate, which absorbs the clock drift between two independent USB
 // devices without audible artifacts (±1000 ppm max ≈ ±1.7 cents).
+//
+// Dropouts and restarts are faded so they do not click: a dropout plays out
+// what is left with a fade-out, every (re)start and the first buffer after the
+// HAL skipped output cycles fade in, and dropping a backlog crossfades from the
+// old read position to the new one. (An input chunk lost while the ring still
+// covers it remains an unfaded splice; it is counted as an input gap.)
 #include "PassthroughCore.h"
 #include <math.h>
 
@@ -27,12 +33,14 @@
 #define KI_PPM_PER_FRAME_S 0.2     // integral gain (ζ ≈ 1, ωn ≈ 0.1 rad/s at 48 kHz)
 #define MAX_PPM 1000.0
 #define FILL_EMA_SECONDS 0.5
-#define RESYNC_SLACK_FRAMES 2400   // this far above target => drop the backlog
+#define RESYNC_MIN_SLACK_FRAMES 480 // 10 ms (+ one input buffer) above target => drop the backlog
 #define TARGET_STEP_FRAMES 64      // added after each jitter underrun
 #define TARGET_MAX_EXTRA 2048
 #define TARGET_DECAY_SECONDS 60.0  // quiet time before giving some of it back
 #define TARGET_DECAY_FRAMES 16
 #define DECAY_HEADROOM_FRAMES 48   // spare frames that must remain after a decay step
+#define FADE_FRAMES 96             // 2 ms fade-in / crossfade
+#define FADE_RESERVE_FRAMES 32     // kept back so a dropout always has audio left to fade out
 
 struct PTCore {
     float *ring[PT_CH];
@@ -56,6 +64,11 @@ struct PTCore {
     _Atomic uint32_t inChunk;      // input IO buffer size in frames
     double nextSampleTime;         // input thread only
 
+    // Fade curves, computed once (no libm on the IO threads).
+    float fadeIn[FADE_FRAMES];     // raised cosine 0 -> 1
+    float xfadeNew[FADE_FRAMES];   // equal power: sin, for two unrelated stretches of audio
+    float xfadeOld[FADE_FRAMES];   // equal power: cos
+
     // Output side. Written by the control thread while the output is stopped.
     AudioUnit outUnit, vsUnit;
     double outRate;
@@ -69,10 +82,16 @@ struct PTCore {
     int running;
     int underrunPending;           // ran dry; classified once audio flows again
     uint64_t gapsAtUnderrun;
+    uint32_t fadeInPos;            // frames into the fade-in after a (re)start
+    float xfOld[PT_CH][FADE_FRAMES]; // backlog drop: the audio being faded out, copied
+    uint32_t xfLeft;                 // before the read position moves (the writer may reuse it)
+    float gain;                    // volume applied to the last buffer (ramps toward `volume`)
+    double nextOutSampleTime;
 
     _Atomic uint32_t margin;
     _Atomic float volume;
     _Atomic uint64_t underruns, inputGaps, overruns, resyncs, inCb, outCb;
+    _Atomic uint64_t dropouts, inputErrors, outputSkips;
     _Atomic double pubFill, pubPPM;
     _Atomic uint32_t pubTarget, pubRunning;
 };
@@ -118,12 +137,19 @@ static OSStatus in_cb(void *ref, AudioUnitRenderActionFlags *flags, const AudioT
         c->inABL->mBuffers[ch].mDataByteSize = n * sizeof(float);
     }
     OSStatus err = AudioUnitRender(c->inUnit, flags, ts, bus, n, c->inABL);
-    if (err != noErr) return err;
+    if (err != noErr) {
+        // This chunk is lost. nextSampleTime stays put, so the next callback
+        // counts the hole as a gap and the dropout is not blamed on jitter.
+        atomic_fetch_add_explicit(&c->inputErrors, 1, memory_order_relaxed);
+        return err;
+    }
 
     // A jump in device sample time means the device delivered nothing for a
-    // while (e.g. the USB audio stream was restarted after a transfer error).
+    // while: the USB audio stream was restarted after a transfer error, the HAL
+    // skipped a cycle, or Core Audio restarted the device's IO. Even one lost
+    // buffer counts.
     if (ts->mFlags & kAudioTimeStampSampleTimeValid) {
-        if (c->nextSampleTime >= 0 && fabs(ts->mSampleTime - c->nextSampleTime) > (double)n) {
+        if (c->nextSampleTime >= 0 && fabs(ts->mSampleTime - c->nextSampleTime) > (double)n / 2) {
             atomic_fetch_add_explicit(&c->inputGaps, 1, memory_order_relaxed);
         }
         c->nextSampleTime = ts->mSampleTime + n;
@@ -184,11 +210,31 @@ static OSStatus vs_pull(void *ref, AudioUnitRenderActionFlags *flags, const Audi
     PTCore *c = ref;
     int64_t r = atomic_load_explicit(&c->rpos, memory_order_relaxed);
     int64_t w = atomic_load_explicit(&c->wpos, memory_order_acquire);
-    if (!c->running || w - r < (int64_t)n) {
+    if (!c->running || w - r < (int64_t)n + FADE_RESERVE_FRAMES) {
+        int64_t left = w - r;
         if (c->running) {
             c->running = 0;
             c->underrunPending = 1;
             c->gapsAtUnderrun = atomic_load_explicit(&c->inputGaps, memory_order_relaxed);
+            atomic_fetch_add_explicit(&c->dropouts, 1, memory_order_relaxed);
+            if (left > 0) {
+                // Play out what is left with a fade instead of cutting it off.
+                uint32_t a = left > (int64_t)n ? n : (uint32_t)left;
+                for (UInt32 ch = 0; ch < io->mNumberBuffers && ch < PT_CH; ch++) {
+                    float *dst = io->mBuffers[ch].mData;
+                    for (uint32_t i = 0; i < a; i++) {
+                        // Curve index for i / a, rounded up so it never goes below 0.
+                        uint32_t k = (uint32_t)(((uint64_t)(i + 1) * FADE_FRAMES + a - 1) / a) - 1;
+                        dst[i] = c->ring[ch][(r + i) & c->mask] * (1.0f - c->fadeIn[k]);
+                    }
+                    memset(dst + a, 0, (n - a) * sizeof(float));
+                }
+                // Leftovers beyond this slice are dropped: replayed after the gap
+                // they would be spliced against the new audio.
+                atomic_store_explicit(&c->rpos, r + left, memory_order_release);
+                c->xfLeft = 0;
+                return noErr;
+            }
         }
         zero_abl(io);
         *flags |= kAudioUnitRenderAction_OutputIsSilence;
@@ -202,8 +248,22 @@ static OSStatus vs_pull(void *ref, AudioUnitRenderActionFlags *flags, const Audi
         memcpy(dst, c->ring[ch] + off, first * sizeof(float));
         memcpy(dst + first, c->ring[ch], (n - first) * sizeof(float));
     }
+    for (uint32_t i = 0; i < n && c->xfLeft > 0; i++, c->xfLeft--) {
+        // Backlog dropped: the old position fades out while the new one fades in.
+        uint32_t k = FADE_FRAMES - c->xfLeft;
+        for (UInt32 ch = 0; ch < io->mNumberBuffers && ch < PT_CH; ch++) {
+            float *dst = io->mBuffers[ch].mData;
+            dst[i] = dst[i] * c->xfadeNew[k] + c->xfOld[ch][k] * c->xfadeOld[k];
+        }
+    }
+    for (uint32_t i = 0; i < n && c->fadeInPos < FADE_FRAMES; i++, c->fadeInPos++) {
+        for (UInt32 ch = 0; ch < io->mNumberBuffers && ch < PT_CH; ch++) {
+            ((float *)io->mBuffers[ch].mData)[i] *= c->fadeIn[c->fadeInPos];
+        }
+    }
     atomic_store_explicit(&c->rpos, r + n, memory_order_release);
-    double headroom = (double)(w - r - (int64_t)n);
+    // Frames to spare before this pull would have been a dropout.
+    double headroom = (double)(w - r - (int64_t)n - FADE_RESERVE_FRAMES);
     if (headroom < c->minHeadroom) c->minHeadroom = headroom;
     return noErr;
 }
@@ -211,6 +271,17 @@ static OSStatus vs_pull(void *ref, AudioUnitRenderActionFlags *flags, const Audi
 static double current_target(PTCore *c) CA_REALTIME_API {
     return (double)atomic_load_explicit(&c->inChunk, memory_order_relaxed) + c->outChunk
          + (double)atomic_load_explicit(&c->margin, memory_order_relaxed) + (double)c->extraTarget;
+}
+
+/// How far above the target the raw fill may go before the backlog is dropped.
+/// A late input callback and its catch-up can add up to one input buffer. Never
+/// so far that the ring overflows (and drops input) first.
+static double resync_slack(PTCore *c, double target) CA_REALTIME_API {
+    double chunk = (double)atomic_load_explicit(&c->inChunk, memory_order_relaxed);
+    double slack = RESYNC_MIN_SLACK_FRAMES + chunk;
+    double room = (double)c->cap - chunk - target - 1;
+    if (slack > room) slack = room;
+    return slack > 0 ? slack : 0;
 }
 
 // Output AUHAL render callback (output device IO thread).
@@ -224,22 +295,56 @@ static OSStatus out_cb(void *ref, AudioUnitRenderActionFlags *flags, const Audio
     double target = current_target(c);
     double dt = (double)n / c->outRate;
 
+    // A jump in the output sample time means the HAL skipped output cycles
+    // (an IO overload, or Core Audio restarting the device): the device played
+    // silence, so this buffer fades in (through the volume ramp below).
+    int skipped = 0;
+    if (ts->mFlags & kAudioTimeStampSampleTimeValid) {
+        if (c->nextOutSampleTime >= 0 && fabs(ts->mSampleTime - c->nextOutSampleTime) > (double)n / 2) {
+            atomic_fetch_add_explicit(&c->outputSkips, 1, memory_order_relaxed);
+            skipped = 1;
+        }
+        c->nextOutSampleTime = ts->mSampleTime + n;
+    }
+
     if (!c->running) {
-        if (fill >= target && c->underrunPending) {
+        // Resume on the same extrapolated fill the controller steers, so it
+        // starts without an error to work off.
+        double vfill = virtual_fill(c, r);
+        if (vfill >= target && c->underrunPending) {
             // Decide before resuming so a raised target takes effect now.
             classify_underrun(c);
             target = current_target(c);
         }
-        if (fill >= target) {
+        if (vfill >= target) {
+            // Start exactly at the target (this also drops stale audio after a
+            // long stall); the fade-in hides the frames skipped here.
+            int64_t skip = (int64_t)(vfill - target);
+            if (skip > 0) {
+                atomic_store_explicit(&c->rpos, r + skip, memory_order_release);
+                vfill = virtual_fill(c, r + skip);
+            }
             c->running = 1;
-            c->avgFill = fill;
+            c->avgFill = vfill;
+            c->fadeInPos = 0;
+            c->xfLeft = 0;
         }
-    } else if (fill > target + RESYNC_SLACK_FRAMES) {
-        // Backlog after a stall or wake: jump back to the target instead of
-        // slowly draining it at +1000 ppm.
-        atomic_store_explicit(&c->rpos, w - (int64_t)target, memory_order_release);
-        c->avgFill = target;
-        c->integ = 0;
+    } else if (fill > target + resync_slack(c, target)) {
+        // Backlog after a stall, an overload or a burst: jump back to the target
+        // instead of slowly draining it at +1000 ppm, crossfading so it does not
+        // click. The integrator keeps its drift estimate. The audio being faded
+        // out is copied first: once rpos moves, the writer may overwrite it.
+        for (int ch = 0; ch < PT_CH; ch++) {
+            for (uint32_t i = 0; i < FADE_FRAMES; i++) c->xfOld[ch][i] = c->ring[ch][(r + i) & c->mask];
+        }
+        c->xfLeft = FADE_FRAMES;
+        // Land the extrapolated fill (what the controller steers) on the target,
+        // as the resume path does, not the raw fill.
+        int64_t nr = w - (int64_t)target;
+        double over = virtual_fill(c, nr) - target;
+        if (over > 0) nr += (int64_t)over;
+        atomic_store_explicit(&c->rpos, nr, memory_order_release);
+        c->avgFill = virtual_fill(c, nr);
         atomic_fetch_add_explicit(&c->resyncs, 1, memory_order_relaxed);
     }
 
@@ -248,7 +353,11 @@ static OSStatus out_cb(void *ref, AudioUnitRenderActionFlags *flags, const Audio
     c->avgFill += (virtual_fill(c, atomic_load_explicit(&c->rpos, memory_order_relaxed)) - c->avgFill) * a;
     double e = c->avgFill - target;
     if (c->running) {
-        c->integ += e * dt;
+        // Conditional integration: no wind-up while the rate is pinned in the
+        // direction of the error (draining a backlog), which would otherwise
+        // overshoot the fill below the target and cause a second dropout later.
+        double u = KP_PPM_PER_FRAME * e + KI_PPM_PER_FRAME_S * (c->integ + e * dt);
+        if (fabs(u) < MAX_PPM || (u > 0) != (e > 0)) c->integ += e * dt;
         double limit = MAX_PPM / KI_PPM_PER_FRAME_S;
         if (c->integ > limit) c->integ = limit;
         if (c->integ < -limit) c->integ = -limit;
@@ -278,12 +387,16 @@ static OSStatus out_cb(void *ref, AudioUnitRenderActionFlags *flags, const Audio
     }
 
     float volume = atomic_load_explicit(&c->volume, memory_order_relaxed);
-    if (volume != 1.0f) {
+    float from = skipped ? 0.0f : c->gain;
+    if (volume != 1.0f || from != 1.0f) {
+        // A volume change ramps across this buffer instead of stepping (a step clicks).
         for (UInt32 i = 0; i < io->mNumberBuffers; i++) {
             float *p = io->mBuffers[i].mData;
             UInt32 count = io->mBuffers[i].mDataByteSize / sizeof(float);
-            for (UInt32 k = 0; k < count; k++) p[k] *= volume;
+            float step = count > 0 ? (volume - from) / (float)count : 0;
+            for (UInt32 k = 0; k < count; k++) p[k] *= from + step * (float)(k + 1);
         }
+        c->gain = volume;
     }
 
     atomic_store_explicit(&c->pubFill, c->avgFill, memory_order_relaxed);
@@ -353,6 +466,13 @@ PTCore *pt_create(uint32_t ringFrames, uint32_t maxIOFrames) {
         pt_destroy(c);
         return NULL;
     }
+    for (int i = 0; i < FADE_FRAMES; i++) {
+        double x = (double)(i + 1) / FADE_FRAMES;
+        c->fadeIn[i] = (float)(0.5 - 0.5 * cos(M_PI * x));
+        c->xfadeNew[i] = (float)sin(M_PI_2 * x);
+        c->xfadeOld[i] = (float)cos(M_PI_2 * x);
+    }
+    c->gain = 1.0f;
     c->inRate = 48000;
     c->outRate = 48000;
     c->framesPerNs = 48000 / 1e9;
@@ -423,6 +543,10 @@ double pt_input_sample_rate(const PTCore *c) {
     return c->inRate;
 }
 
+double pt_output_sample_rate(const PTCore *c) {
+    return c->outRate;
+}
+
 OSStatus pt_start_output(PTCore *c, AudioObjectID device, uint32_t ioFrames, double inputSampleRate) {
     pt_stop_output(c);
     double outRate = nominal_rate(device);
@@ -443,7 +567,9 @@ OSStatus pt_start_output(PTCore *c, AudioObjectID device, uint32_t ioFrames, dou
     AudioStreamBasicDescription fin = float_planar(inputSampleRate, PT_CH);
     AudioStreamBasicDescription fout = float_planar(outRate, PT_CH);
     UInt32 maxIO = c->maxIO;
-    UInt32 quality = kRenderQuality_Medium;   // 0.33 ms of SRC latency (Max adds 1 ms)
+    // Measured: Medium = 0.33 ms of SRC latency (Max 1 ms), flat to 17 kHz and
+    // no level modulation at any drift rate.
+    UInt32 quality = kRenderQuality_Medium;
     if (!e) e = AudioUnitSetProperty(vs, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &fin, sizeof(fin));
     if (!e) e = AudioUnitSetProperty(vs, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &fout, sizeof(fout));
     if (!e) e = AudioUnitSetProperty(vs, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxIO, sizeof(maxIO));
@@ -467,6 +593,9 @@ OSStatus pt_start_output(PTCore *c, AudioObjectID device, uint32_t ioFrames, dou
     // A margin learned on another device or under a load burst does not carry over.
     c->running = 0;
     c->underrunPending = 0;
+    c->fadeInPos = 0;
+    c->xfLeft = 0;
+    c->nextOutSampleTime = -1;
     c->extraTarget = 0;
     c->avgFill = 0;
     c->integ = 0;
@@ -507,4 +636,7 @@ void pt_get_stats(PTCore *c, PTStats *o) {
     o->resyncs = atomic_load_explicit(&c->resyncs, memory_order_relaxed);
     o->inputCallbacks = atomic_load_explicit(&c->inCb, memory_order_relaxed);
     o->outputCallbacks = atomic_load_explicit(&c->outCb, memory_order_relaxed);
+    o->dropouts = atomic_load_explicit(&c->dropouts, memory_order_relaxed);
+    o->inputErrors = atomic_load_explicit(&c->inputErrors, memory_order_relaxed);
+    o->outputSkips = atomic_load_explicit(&c->outputSkips, memory_order_relaxed);
 }

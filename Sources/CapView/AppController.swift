@@ -258,6 +258,7 @@ final class AppController: NSObject, NSMenuDelegate {
     private func checkFrames() {
         watchdogTicks += 1
         if watchdogTicks % 5 == 0 { updateAudio() }
+        audio.checkHealth()
 
         let now = CACurrentMediaTime()
         if let gaps = audio.status?.inputGaps, gaps != lastInputGaps {
@@ -572,11 +573,13 @@ final class AppController: NSObject, NSMenuDelegate {
         }
         if let status = audio.status {
             menu.addItem(disabled: String(format: "예상 오디오 지연 ≈ %.0f ms", status.latencyMilliseconds))
-            if status.inputGaps > 0 || status.underruns > 0 {
-                menu.addItem(disabled: "소리 끊김: 캡처보드 \(status.inputGaps)회 · 재생 \(status.underruns)회")
+            if status.inputGaps > 0 || status.underruns > 0 || status.resyncs > 0 {
+                menu.addItem(disabled: "소리 끊김: 캡처보드 \(status.inputGaps)회 · 재생 \(status.underruns)회 · 지연 맞춤 \(status.resyncs)회")
             }
             if CACurrentMediaTime() - lastInputGapTime < 300 {
-                menu.addItem(disabled: "캡처보드의 USB 오디오가 끊기고 있습니다. 허브 대신 Mac에 직접 연결해 보세요.")
+                // Core Audio restarting the device's IO (some apps trigger that when
+                // they start) looks the same as a USB drop from here.
+                menu.addItem(disabled: "캡처보드 오디오가 잠깐씩 끊기고 있습니다. USB 연결(허브)이나 다른 앱의 오디오 장치 재시작 때문일 수 있습니다.")
             }
         }
 

@@ -75,6 +75,10 @@ enum CoreAudioDevices {
         return ids
     }
 
+    static func name(_ id: AudioObjectID) -> String? {
+        string(id, kAudioObjectPropertyName)
+    }
+
     static func string(_ id: AudioObjectID, _ selector: AudioObjectPropertySelector) -> String? {
         var address = globalAddress(selector)
         var value: Unmanaged<CFString>?
